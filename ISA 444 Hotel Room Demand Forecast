@@ -1,0 +1,314 @@
+!pip install statsforecast mlforecast neuralforecast xgboost nixtla
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from statsforecast.models import Naive, SeasonalNaive, AutoETS, AutoARIMA
+from statsforecast import StatsForecast
+
+from neuralforecast import NeuralForecast
+from neuralforecast.auto import AutoNBEATS, AutoNHITS
+from nixtla import NixtlaClient
+
+from mlforecast import MLForecast
+import xgboost as xgb
+
+from sklearn.linear_model import LinearRegression
+from mlforecast.lag_transforms import RollingMean
+
+from utilsforecast.losses import mape, mae, rmse
+from utilsforecast.evaluation import evaluate
+
+df = pd.read_parquet("sample_hotels.parquet")
+df = df[['unique_id', 'ds', 'y']]
+df['ds'] = pd.to_datetime(df['ds'])
+df.tail() ## we need to predict four weeks after 2023-06-30
+
+## StatsForecast
+sf = StatsForecast(
+    models = [
+        Naive(),
+        SeasonalNaive(season_length=7),
+        AutoETS(),
+        AutoARIMA()],
+    freq='D',
+    n_jobs=-1       # use all cores
+)
+
+sf_cross_df = sf.cross_validation(
+    df=df,
+    h=28,
+    n_windows=5,
+    step_size=5
+)
+
+## NeuralForecast
+# neural Network models
+# note: use GPU otherwise this code will run for >2 hrs
+nn_models = [
+    AutoNBEATS(h=28),
+    AutoNHITS(h=28),
+]
+
+nn = NeuralForecast(
+    models = nn_models,
+    freq = 'D')
+
+nn_cross_df = nn.cross_validation(
+    h = 28,
+    df = df,
+    n_windows = 5,
+    step_size = 5) # no overlapping of windows
+
+nn_cross_df
+
+## TimeGPT
+## I used dotenv from ISA414 to keep the Nixtla API Key a secret
+
+import os
+from dotenv import load_dotenv, find_dotenv
+
+load_dotenv(find_dotenv())
+
+APIKEY = os.getenv("NIXTLA_APIKEY")
+nixtla_client = NixtlaClient(api_key = APIKEY)
+nixtla_client.validate_api_key()
+
+### Cross validation
+timegpt_cross_df = nixtla_client.cross_validation(
+    h = 28,
+    df = df,
+    n_windows = 5,
+    step_size = 5,
+    freq = "D")
+
+timegpt_cross_df
+
+## MLForecast
+
+## Includes code from ChatGPT
+from mlforecast import MLForecast
+import xgboost as xgb
+
+# Make sure modified_df has at least: ['unique_id', 'ds', 'y'] plus your extra features
+modified_df = pd.read_parquet("sample_hotels.parquet").copy()
+modified_df['ds'] = pd.to_datetime(modified_df['ds'])
+
+# Example of encoding your features (adjust to match your notebook):
+modified_df['day'] = modified_df['day'].astype('category').cat.codes
+modified_df['month'] = modified_df['month'].astype('category').cat.codes
+
+ml_model = xgb.XGBRegressor(
+    enable_categorical=True,
+    n_estimators=200,
+    max_depth=6,
+    learning_rate=0.1,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42
+)
+
+mlf = MLForecast(
+    models=ml_model,
+    freq='D',
+    lags=range(28, 56),       # same as you used before
+    lag_transforms={          # put your existing lag_transforms here
+        # 28: [mean],  # example
+        # 29: [max],
+    },
+    date_features=[]          # or ['dayofweek', 'month'] if you want
+)
+
+mlf_cross_df = mlf.cross_validation(
+    df=modified_df,
+    h=28,
+    n_windows=5,
+    step_size=5,
+    static_features=[]        # or list of static columns if you have them
+)
+
+display(mlf_cross_df.head())
+
+## 5-fold Time-Series Cross-Validation (non-overlapping)
+## Combining all four cross validation dfs
+mlf_clean = mlf_cross_df.drop(columns=["cutoff", "fold"], errors="ignore")
+nn_clean = nn_cross_df.drop(columns=["cutoff", "y"], errors="ignore")
+timegpt_clean = timegpt_cross_df.drop(columns=["cutoff", "y"], errors="ignore")
+
+combined_df = (
+    sf_cross_df.merge(nn_clean, on=["unique_id", "ds"], how="right")
+               .merge(mlf_clean, on=["unique_id", "ds"], how="right")
+               .merge(timegpt_clean, on=["unique_id", "ds"], how="right")
+).assign(
+    y = lambda x: x["y_x"]
+)
+
+combo_df = combined_df[['unique_id', 'ds', 'y', 'Naive', 'SeasonalNaive', 'AutoETS', 'AutoARIMA',
+             'AutoNBEATS', 'AutoNHITS', 'XGBRegressor', 'TimeGPT']]
+
+display(combo_df)
+
+
+## Reporting metrics (we chose to use MAPE, RMSE, and MAE)
+## Evaluation
+combo_eval = evaluate(
+    df = combo_df,
+    metrics = [mape, rmse, mae],
+    models = [
+        'Naive', 
+        'SeasonalNaive', 
+        'AutoETS', 
+        'AutoARIMA',
+        'AutoNBEATS',
+        'AutoNHITS',
+        'XGBRegressor',
+        'TimeGPT'
+    ]
+)
+
+display(combo_eval)
+
+## Metric Win Counts by Model
+## Metric win counts by model
+metrics = ["mae", "mape", "rmse"]
+
+metric_win_counts = {}
+
+for m in metrics:
+    row = combo_eval[combo_eval["metric"] == m]
+    model_scores = row.drop(columns=["unique_id", "metric"])
+    winners = model_scores.idxmin(axis=1)
+    win_count = winners.value_counts().to_dict()
+
+    metric_win_counts[m] = win_count
+
+metric_win_counts
+
+## Best model by each metric 
+metrics = ["mae", "mape", "rmse"] 
+best_models = {} 
+for m in metrics: 
+  row = combo_eval[combo_eval["metric"] == m] 
+  model_scores = row.drop(columns=["unique_id", "metric"]) 
+  best_model = model_scores.idxmin(axis=1).iloc[0] 
+  best_models[m] = best_model 
+  
+print(best_models)
+
+'''
+Best models by metric:
+
+* MAE - AutoNHITS
+* MAPE - AutoNHITS
+* RMSE - XGBRegressor
+'''
+
+# Saving the testing outputs and evaluation in .csv files
+combo_df.to_csv("ISA444Hotel_CrossValidation.csv", index=False)
+combo_eval.to_csv("ISA444Hotel_ModelEvaluation.csv", index=False)
+
+## Plotting Forecasts vs. Actual
+## Using the last cross validation window to plot
+sf_fcst = sf_cross_df[sf_cross_df['cutoff'] == sf_cross_df['cutoff'].max()]
+mlf_fcst = mlf_cross_df[mlf_cross_df['cutoff'] == mlf_cross_df['cutoff'].max()]
+nn_fcst = nn_cross_df[nn_cross_df['cutoff'] == nn_cross_df['cutoff'].max()]
+timegpt_fcst = timegpt_cross_df[timegpt_cross_df['cutoff'] == timegpt_cross_df['cutoff'].max()]
+
+## Cleaning the forecasts to merge them
+mlf_fcstclean = mlf_fcst.drop(columns=["cutoff", "fold"], errors="ignore")
+nn_fcstclean = nn_fcst.drop(columns=["cutoff", "y"], errors="ignore")
+timegpt_fcstclean = timegpt_fcst.drop(columns=["cutoff", "y"], errors="ignore")
+
+## Merging the forecasts to plot them
+combo_fcst_toplot = (
+    sf_fcst.merge(mlf_fcstclean, on=["unique_id", "ds"], how="right")
+           .merge(nn_fcstclean, on=["unique_id", "ds"], how="right")
+           .merge(timegpt_fcstclean, on=["unique_id", "ds"], how="right")
+           .assign(y = lambda x: x["y_x"]).drop(columns=["y_x"])
+)
+combo_fcst_toplot.head()
+
+import matplotlib.pyplot as plt
+
+models = ["Naive", "SeasonalNaive", "AutoETS", "AutoARIMA",
+          "XGBRegressor", "AutoNBEATS", "AutoNHITS", "TimeGPT"]
+
+## Combined forecasts from before (including actual)
+plot_df = combo_fcst_toplot
+
+## Plot forecasts vs. actuals for each series
+num_hotels = plot_df['unique_id'].nunique()
+fig, axes = plt.subplots(num_hotels, 1, figsize = (15, 5 * num_hotels), sharex=True)
+
+if num_hotels == 1:
+    axes = [axes]
+
+for i, hotel_id in enumerate(plot_df['unique_id'].unique()):
+    subset_df = plot_df[plot_df['unique_id'] == hotel_id]
+    axes[i].plot(subset_df['ds'], subset_df['y'], label = f'Actual', color='black', linewidth = 2) # to make actual `y` value stand out
+    for model_name in models:
+        axes[i].plot(subset_df['ds'], subset_df[model_name], label = f'{model_name}', linestyle='--')
+
+    axes[i].set_title(f'Forecasts vs Actuals for {hotel_id}')
+    axes[i].set_ylabel('Occupancy Rate')
+    axes[i].legend()
+    axes[i].grid(True)
+
+plt.xlabel('Date')
+plt.tight_layout()
+plt.show()
+
+## Predicting the Next Four Weeks of Daily Room Demand
+mlf.fit(df)
+nn.fit(df)
+
+## Forecasting four weeks into the future by day
+future_horizon = 28
+frequency = "D"
+
+future_forecasts = sf.forecast(df=df, h=future_horizon)
+mlf_forecast = mlf.predict(h=future_horizon) # MLF uses predict instead of forecast
+nn_forecast = nn.predict(h=future_horizon)
+timegpt_forecast = nixtla_client.forecast(df=df, h=future_horizon, freq=frequency)
+
+## Merging the forecasts
+combo_future_forecasts = (
+    future_forecasts.merge(mlf_forecast, on=["unique_id", "ds"], how="right")
+                     .merge(nn_forecast, on=["unique_id", "ds"], how="right")
+                     .merge(timegpt_forecast, on=["unique_id", "ds"], how="right")
+)
+
+combo_future_forecasts
+
+## plotting the forecast
+
+models = ["Naive", "SeasonalNaive", "AutoETS", "AutoARIMA",
+          "XGBRegressor", "AutoNBEATS", "AutoNHITS", "TimeGPT"]
+
+## Combined forecasts from before (including actual)
+plot_df = combo_future_forecasts
+
+## Plot forecasts vs. actuals for each series
+num_hotels = plot_df['unique_id'].nunique()
+fig, axes = plt.subplots(num_hotels, 1, figsize = (15, 5 * num_hotels), sharex=True)
+
+if num_hotels == 1:
+    axes = [axes]
+
+for i, hotel_id in enumerate(plot_df['unique_id'].unique()):
+    subset_df = plot_df[plot_df['unique_id'] == hotel_id]
+    for model_name in models:
+        axes[i].plot(subset_df['ds'], subset_df[model_name], label = f'{model_name}', linestyle='--')
+
+    axes[i].set_title(f'Forecasts vs Actuals for {hotel_id}')
+    axes[i].set_ylabel('Forecasted Room Demand')
+    axes[i].legend()
+    axes[i].grid(True)
+
+plt.xlabel('Date')
+plt.tight_layout()
+plt.show()
+
+''' 
+Naive, AutoETS, and AutoARIMA flattened out in the predictions of several of the hotels. Outside of these three, the other models tended to follow similar patterns across the 28 days for hotels 0, 42, 63, and 98. 
+'''
